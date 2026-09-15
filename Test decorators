@@ -1,0 +1,312 @@
+"""Unit tests for :mod:`corekit.core.decorators`."""
+
+from __future__ import annotations
+
+import logging
+import threading
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+
+from corekit.core.decorators import (
+    Cache,
+    cache,
+    deprecated,
+    retry,
+    timer,
+    validate_call,
+)
+from corekit.exceptions import RetryError, ValidationError
+
+
+# --------------------------------------------------------------------------- #
+# retry
+# --------------------------------------------------------------------------- #
+class TestRetry:
+    def test_returns_immediately_when_the_call_succeeds(self) -> None:
+        target = MagicMock(return_value="ok")
+
+        @retry(max_attempts=3, delay=0)
+        def call() -> Any:
+            return target()
+
+        assert call() == "ok"
+        assert target.call_count == 1
+
+    def test_retries_until_success(self, sleeps: list[float]) -> None:
+        attempts = {"n": 0}
+
+        @retry(max_attempts=3, delay=1, backoff=2, sleep=sleeps.append)
+        def flaky() -> str:
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise ConnectionError("unavailable")
+            return "recovered"
+
+        assert flaky() == "recovered"
+        assert attempts["n"] == 3
+
+    def test_applies_exponential_backoff(self, sleeps: list[float]) -> None:
+        @retry(max_attempts=4, delay=0.5, backoff=2, sleep=sleeps.append)
+        def always_fails() -> None:
+            raise ValueError("nope")
+
+        with pytest.raises(RetryError):
+            always_fails()
+        assert sleeps == [0.5, 1.0, 2.0]
+
+    def test_raises_retry_error_chaining_the_last_failure(self) -> None:
+        @retry(max_attempts=2, delay=0, sleep=lambda _: None)
+        def always_fails() -> None:
+            raise KeyError("missing")
+
+        with pytest.raises(RetryError) as info:
+            always_fails()
+        assert info.value.attempts == 2
+        assert isinstance(info.value.__cause__, KeyError)
+
+    def test_does_not_retry_unlisted_exceptions(self, sleeps: list[float]) -> None:
+        @retry(max_attempts=3, delay=0, exceptions=ValueError, sleep=sleeps.append)
+        def wrong_error() -> None:
+            raise TypeError("different")
+
+        with pytest.raises(TypeError):
+            wrong_error()
+        assert sleeps == []
+
+    @pytest.mark.parametrize(
+        "kwargs", [{"max_attempts": 0}, {"delay": -1}, {"backoff": -2}]
+    )
+    def test_rejects_invalid_configuration(self, kwargs: dict[str, Any]) -> None:
+        with pytest.raises(ValueError):
+            retry(**kwargs)
+
+    def test_preserves_metadata(self) -> None:
+        @retry(max_attempts=1)
+        def documented(value: int) -> int:
+            """Original docstring."""
+            return value
+
+        assert documented.__name__ == "documented"
+        assert documented.__doc__ == "Original docstring."
+        assert documented.__wrapped__.__name__ == "documented"
+
+    def test_logs_a_warning_per_failure(self, caplog: pytest.LogCaptureFixture) -> None:
+        @retry(max_attempts=2, delay=0, sleep=lambda _: None)
+        def failing() -> None:
+            raise RuntimeError("boom")
+
+        with caplog.at_level(logging.WARNING), pytest.raises(RetryError):
+            failing()
+        assert len(caplog.records) == 2
+
+
+# --------------------------------------------------------------------------- #
+# cache
+# --------------------------------------------------------------------------- #
+class TestCache:
+    def test_repeated_calls_hit_the_cache(self) -> None:
+        calls: list[int] = []
+
+        @cache(ttl=None)
+        def double(value: int) -> int:
+            calls.append(value)
+            return value * 2
+
+        assert [double(2), double(2), double(3)] == [4, 4, 6]
+        assert calls == [2, 3]
+        assert double.cache.stats == {"hits": 1, "misses": 2, "evictions": 0}
+
+    def test_entries_expire_after_the_ttl(self, clock: Any) -> None:
+        calls: list[int] = []
+
+        @cache(ttl=10, clock=clock)
+        def fetch(value: int) -> int:
+            calls.append(value)
+            return value
+
+        fetch(1)
+        clock.advance(5)
+        fetch(1)
+        clock.advance(6)
+        fetch(1)
+        assert calls == [1, 1]
+
+    def test_keyword_argument_order_does_not_matter(self) -> None:
+        calls: list[tuple[int, int]] = []
+
+        @cache(ttl=None)
+        def add(*, a: int, b: int) -> int:
+            calls.append((a, b))
+            return a + b
+
+        assert add(a=1, b=2) == add(b=2, a=1) == 3
+        assert len(calls) == 1
+
+    def test_handles_unhashable_arguments(self) -> None:
+        @cache(ttl=None)
+        def summarise(payload: dict[str, int]) -> int:
+            return sum(payload.values())
+
+        assert summarise({"a": 1, "b": 2}) == 3
+        assert summarise({"a": 1, "b": 2}) == 3
+
+    def test_evicts_the_oldest_entry_when_full(self) -> None:
+        instance = Cache(ttl=None, maxsize=2)
+
+        @instance
+        def identity(value: int) -> int:
+            return value
+
+        identity(1)
+        identity(2)
+        identity(3)
+        assert len(instance) == 2
+        assert instance.stats["evictions"] == 1
+
+    def test_clear_resets_entries_and_statistics(self) -> None:
+        @cache(ttl=None)
+        def identity(value: int) -> int:
+            return value
+
+        identity(1)
+        identity(1)
+        identity.clear_cache()
+        assert len(identity.cache) == 0
+        assert identity.cache.stats == {"hits": 0, "misses": 0, "evictions": 0}
+
+    def test_rejects_an_invalid_maxsize(self) -> None:
+        with pytest.raises(ValueError):
+            Cache(maxsize=0)
+
+    def test_is_safe_under_concurrent_access(self) -> None:
+        instance = Cache(ttl=None, maxsize=256)
+
+        @instance
+        def slow(value: int) -> int:
+            return value * 2
+
+        results: list[int] = []
+        threads = [
+            threading.Thread(target=lambda n=n: results.append(slow(n % 8)))
+            for n in range(64)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(results) == 64
+        assert len(instance) == 8
+
+    def test_make_key_is_deterministic(self) -> None:
+        first = Cache.make_key("f", (1, "a"), {"x": 1})
+        second = Cache.make_key("f", (1, "a"), {"x": 1})
+        assert first == second
+        assert first != Cache.make_key("f", (1, "b"), {"x": 1})
+
+
+# --------------------------------------------------------------------------- #
+# timer
+# --------------------------------------------------------------------------- #
+class TestTimer:
+    def test_works_without_parentheses(self) -> None:
+        @timer
+        def compute() -> int:
+            return 7
+
+        assert compute() == 7
+
+    def test_reports_elapsed_time_to_the_callback(self) -> None:
+        observed: list[tuple[str, float]] = []
+
+        @timer(on_result=lambda name, secs: observed.append((name, secs)))
+        def compute() -> int:
+            return sum(range(100))
+
+        compute()
+        assert observed[0][0] == "compute"
+        assert observed[0][1] >= 0
+
+    def test_measures_even_when_the_call_raises(self) -> None:
+        observed: list[str] = []
+
+        @timer(on_result=lambda name, secs: observed.append(name))
+        def failing() -> None:
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError):
+            failing()
+        assert observed == ["failing"]
+
+
+# --------------------------------------------------------------------------- #
+# validate_call and deprecated
+# --------------------------------------------------------------------------- #
+class TestValidateCall:
+    def test_accepts_correctly_typed_arguments(self) -> None:
+        @validate_call
+        def repeat(text: str, times: int = 2) -> str:
+            return text * times
+
+        assert repeat("ab") == "abab"
+
+    def test_rejects_a_bad_argument(self) -> None:
+        @validate_call
+        def repeat(text: str, times: int = 2) -> str:
+            return text * times
+
+        with pytest.raises(ValidationError) as info:
+            repeat("ab", times="three")  # type: ignore[arg-type]
+        assert info.value.field == "times"
+
+    def test_rejects_a_bad_return_value(self) -> None:
+        @validate_call
+        def lying() -> int:
+            return "not an int"  # type: ignore[return-value]
+
+        with pytest.raises(ValidationError, match="returned str"):
+            lying()
+
+    def test_checks_variadic_arguments(self) -> None:
+        @validate_call
+        def total(*values: int, **labels: str) -> int:
+            return sum(values)
+
+        assert total(1, 2, label="x") == 3
+        with pytest.raises(ValidationError):
+            total(1, "2")  # type: ignore[arg-type]
+        with pytest.raises(ValidationError):
+            total(1, label=object())  # type: ignore[arg-type]
+
+    def test_ignores_unannotated_parameters(self) -> None:
+        @validate_call
+        def anything(value):  # type: ignore[no-untyped-def]
+            return value
+
+        assert anything(object()) is not None
+
+
+def test_deprecated_emits_a_warning() -> None:
+    @deprecated("use new_api instead")
+    def old_api() -> str:
+        return "value"
+
+    with pytest.warns(DeprecationWarning, match="use new_api instead"):
+        assert old_api() == "value"
+
+
+def test_decorators_compose() -> None:
+    calls: list[int] = []
+
+    @retry(max_attempts=2, delay=0, sleep=lambda _: None)
+    @timer
+    @cache(ttl=None)
+    def fetch(value: int) -> int:
+        calls.append(value)
+        return value * 10
+
+    assert fetch(3) == 30
+    assert fetch(3) == 30
+    assert calls == [3]
