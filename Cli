@@ -1,0 +1,148 @@
+"""Command line interface for ``corekit``.
+
+Installed as the ``corekit`` console script::
+
+    corekit process data.csv --plugin strip --plugin uppercase --limit 5
+    corekit plugins
+    corekit stats data.jsonl --field status
+    corekit --version
+
+Every command returns a POSIX exit status: ``0`` on success, ``1`` on a handled
+library error, ``2`` on bad usage (argparse's own convention).
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from collections.abc import Sequence
+from typing import TextIO
+
+from corekit import __version__
+from corekit.core.generators import DataPipeline, count_by
+from corekit.core.metaclasses import available_plugins, get_plugin, registry
+from corekit.exceptions import CorekitError
+from corekit.utils.serializers import dumps
+
+__all__ = ["build_parser", "main"]
+
+logger = logging.getLogger("corekit.cli")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the argument parser for the ``corekit`` command."""
+    parser = argparse.ArgumentParser(
+        prog="corekit",
+        description="Stream and transform record files with corekit.",
+    )
+    parser.add_argument("--version", action="version", version=f"corekit {__version__}")
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="enable debug logging"
+    )
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    process = subcommands.add_parser(
+        "process", help="stream a CSV/JSONL/TXT file through plugins"
+    )
+    process.add_argument("path", help="file to process")
+    process.add_argument(
+        "-p",
+        "--plugin",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="plugin to apply; repeat to build a chain",
+    )
+    process.add_argument(
+        "-n", "--limit", type=int, default=0, help="stop after N records (0 = all)"
+    )
+    process.add_argument(
+        "--indent", type=int, default=None, help="pretty-print JSON with this indent"
+    )
+
+    plugins = subcommands.add_parser("plugins", help="list registered plugins")
+    plugins.add_argument(
+        "--json", action="store_true", help="emit machine readable output"
+    )
+
+    stats = subcommands.add_parser("stats", help="count records grouped by a field")
+    stats.add_argument("path", help="file to summarise")
+    stats.add_argument("-f", "--field", required=True, help="field to group by")
+
+    return parser
+
+
+def _run_process(args: argparse.Namespace, stream: TextIO) -> int:
+    pipeline = DataPipeline()
+    for name in args.plugin:
+        pipeline.add_processor(get_plugin(name)())
+
+    written = 0
+    for record in pipeline.process_large_file(args.path):
+        print(dumps(record, indent=args.indent), file=stream)
+        written += 1
+        if args.limit and written >= args.limit:
+            break
+    logger.debug("Wrote %d record(s)", written)
+    return 0
+
+
+def _run_plugins(args: argparse.Namespace, stream: TextIO) -> int:
+    if args.json:
+        payload = {
+            name: cls.description or cls.__doc__ or ""
+            for name, cls in sorted(registry().items())
+        }
+        print(dumps(payload, indent=2), file=stream)
+        return 0
+    if not available_plugins():  # pragma: no cover - builtins always present
+        print("No plugins registered.", file=stream)
+        return 0
+    width = max(len(name) for name in available_plugins())
+    for name, cls in sorted(registry().items()):
+        print(f"{name:<{width}}  {cls.description}", file=stream)
+    return 0
+
+
+def _run_stats(args: argparse.Namespace, stream: TextIO) -> int:
+    records = DataPipeline().process_large_file(args.path)
+    counts = count_by(records, key=lambda record: record.get(args.field, "<missing>"))
+    for value, total in sorted(counts.items(), key=lambda item: (-item[1], str(item[0]))):
+        print(f"{total:>8}  {value}", file=stream)
+    return 0
+
+
+def main(argv: Sequence[str] | None = None, stream: TextIO | None = None) -> int:
+    """Entry point for the ``corekit`` console script.
+
+    Args:
+        argv: Argument list; defaults to ``sys.argv[1:]``.
+        stream: Output stream; defaults to :data:`sys.stdout`.
+
+    Returns:
+        The process exit status.
+    """
+    output: TextIO = stream if stream is not None else sys.stdout
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="[%(levelname)s] %(message)s",
+    )
+
+    handlers = {
+        "process": _run_process,
+        "plugins": _run_plugins,
+        "stats": _run_stats,
+    }
+    try:
+        return handlers[args.command](args, output)
+    except (CorekitError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
