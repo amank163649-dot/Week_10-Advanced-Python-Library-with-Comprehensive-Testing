@@ -1,0 +1,131 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "corekit"
+version = "1.0.0"
+description = "Advanced Python building blocks: decorators, generators, context managers and metaclasses."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "corekit contributors" }]
+keywords = ["decorators", "generators", "context-managers", "metaclasses", "typing"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "pytest-benchmark>=4.0",
+    "hypothesis>=6.88",
+    "mypy>=1.8",
+    "ruff>=0.3",
+    "black>=24.1",
+    "isort>=5.13",
+    "pre-commit>=3.6",
+]
+docs = ["sphinx>=7.2", "furo>=2024.1.29"]
+
+[project.urls]
+Homepage = "https://github.com/example/corekit"
+Documentation = "https://example.github.io/corekit"
+Issues = "https://github.com/example/corekit/issues"
+Changelog = "https://github.com/example/corekit/blob/main/CHANGELOG.md"
+
+[project.scripts]
+corekit = "corekit.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+corekit = ["py.typed"]
+
+# --------------------------------------------------------------------------- #
+# Testing
+# --------------------------------------------------------------------------- #
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests", "src"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--doctest-modules",
+    "--cov=corekit",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "--cov-report=xml",
+    "--cov-fail-under=90",
+]
+filterwarnings = ["error", "ignore::DeprecationWarning"]
+markers = ["benchmark: performance benchmarks, excluded from the default run"]
+
+[tool.coverage.run]
+source = ["corekit"]
+branch = true
+omit = ["*/tests/*", "*/benchmarks/*"]
+
+[tool.coverage.report]
+precision = 1
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise AssertionError",
+    "if __name__ == .__main__.:",
+    "\\.\\.\\.",
+]
+
+# --------------------------------------------------------------------------- #
+# Static analysis and formatting
+# --------------------------------------------------------------------------- #
+[tool.mypy]
+python_version = "3.10"
+files = ["src"]
+strict = true
+warn_unreachable = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+known_first_party = ["corekit"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "C4", "SIM", "RUF", "D"]
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+"examples/*" = ["D", "T201"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
