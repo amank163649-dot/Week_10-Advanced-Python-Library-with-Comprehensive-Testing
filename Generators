@@ -1,0 +1,234 @@
+"""Memory-efficient, generator-based data processing.
+
+:class:`DataPipeline` streams records out of CSV, JSON Lines or plain text files
+one at a time, so a file larger than RAM costs the same memory as a small one.
+The module-level helpers (:func:`batched`, :func:`sliding_window`, :func:`take`)
+are generic lazy iterator tools.
+
+Example:
+    >>> pipeline = DataPipeline().add_processor(lambda r: {**r, "seen": True})
+    >>> list(pipeline.process_iterable([{"id": 1}]))
+    [{'id': 1, 'seen': True}]
+"""
+
+from __future__ import annotations
+
+import csv
+import itertools
+import json
+import logging
+from collections.abc import Callable, Iterable, Iterator
+from pathlib import Path
+from typing import Any, TypeVar
+
+from corekit.exceptions import PipelineError
+from corekit.types import Processor, Record
+
+__all__ = [
+    "DataPipeline",
+    "batched",
+    "count_by",
+    "fibonacci",
+    "sliding_window",
+    "take",
+]
+
+logger = logging.getLogger(__name__)
+
+E = TypeVar("E")
+
+#: File suffixes :class:`DataPipeline` knows how to read.
+SUPPORTED_SUFFIXES = (".csv", ".jsonl", ".txt")
+
+
+class DataPipeline:
+    """A lazy chain of record transformations.
+
+    Processors are plain callables taking a record and returning a record, or
+    ``None`` to drop it from the stream. Nothing is read or computed until the
+    resulting generator is iterated.
+
+    Args:
+        processors: Optional initial processors.
+        strict: When true, an exception inside a processor aborts the run;
+            otherwise the offending record is logged and skipped.
+
+    Example:
+        >>> pipeline = DataPipeline(strict=False)
+        >>> _ = pipeline.add_processor(lambda r: r if r["n"] > 1 else None)
+        >>> list(pipeline.process_iterable([{"n": 1}, {"n": 2}]))
+        [{'n': 2}]
+    """
+
+    def __init__(
+        self, processors: Iterable[Processor] | None = None, *, strict: bool = True
+    ) -> None:
+        self.processors: list[Processor] = list(processors or ())
+        self.strict = strict
+        self.skipped = 0
+
+    def add_processor(self, processor: Processor) -> "DataPipeline":
+        """Append a processor and return ``self`` for chaining."""
+        if not callable(processor):
+            raise PipelineError("processor must be callable")
+        self.processors.append(processor)
+        return self
+
+    def add_filter(self, predicate: Callable[[Record], bool]) -> "DataPipeline":
+        """Append a predicate; records failing it are dropped."""
+        return self.add_processor(lambda record: record if predicate(record) else None)
+
+    def process_iterable(self, records: Iterable[Record]) -> Iterator[Record]:
+        """Run every processor over ``records``, yielding survivors lazily."""
+        for record in records:
+            result = self._apply(record)
+            if result is not None:
+                yield result
+
+    def process_large_file(
+        self, filepath: str | Path, *, encoding: str = "utf-8"
+    ) -> Iterator[Record]:
+        """Stream a file record by record.
+
+        Args:
+            filepath: Path to a ``.csv``, ``.jsonl`` or ``.txt`` file.
+            encoding: Text encoding of the file.
+
+        Yields:
+            One processed record at a time.
+
+        Raises:
+            FileNotFoundError: If the path does not exist.
+            PipelineError: If the suffix is not supported.
+        """
+        path = Path(filepath)
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        if path.suffix not in SUPPORTED_SUFFIXES:
+            raise PipelineError(
+                f"Unsupported file format {path.suffix!r}; "
+                f"expected one of {', '.join(SUPPORTED_SUFFIXES)}"
+            )
+
+        readers = {
+            ".csv": self._read_csv,
+            ".jsonl": self._read_jsonl,
+            ".txt": self._read_text,
+        }
+        yield from self.process_iterable(readers[path.suffix](path, encoding))
+
+    @staticmethod
+    def _read_csv(path: Path, encoding: str) -> Iterator[Record]:
+        with path.open("r", encoding=encoding, newline="") as handle:
+            yield from csv.DictReader(handle)
+
+    @staticmethod
+    def _read_jsonl(path: Path, encoding: str) -> Iterator[Record]:
+        with path.open("r", encoding=encoding) as handle:
+            for number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError as exc:
+                    logger.warning("Skipping invalid JSON on line %d: %s", number, exc)
+
+    @staticmethod
+    def _read_text(path: Path, encoding: str) -> Iterator[Record]:
+        with path.open("r", encoding=encoding) as handle:
+            for number, line in enumerate(handle, 1):
+                yield {"line_number": number, "content": line.rstrip("\n")}
+
+    def _apply(self, record: Record) -> Record | None:
+        result: Record | None = record
+        for processor in self.processors:
+            if result is None:
+                return None
+            try:
+                result = processor(result)
+            except Exception as exc:
+                if self.strict:
+                    raise PipelineError(
+                        f"processor {getattr(processor, '__name__', processor)!r} "
+                        f"failed: {exc}"
+                    ) from exc
+                self.skipped += 1
+                logger.warning("Dropping record after processor error: %s", exc)
+                return None
+        return result
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return f"DataPipeline(processors={len(self.processors)}, strict={self.strict})"
+
+
+def batched(items: Iterable[E], size: int = 1000) -> Iterator[list[E]]:
+    """Yield consecutive lists of at most ``size`` items.
+
+    Args:
+        items: Any iterable; consumed lazily.
+        size: Maximum batch length.
+
+    Raises:
+        ValueError: If ``size`` is below 1.
+
+    Example:
+        >>> list(batched(range(5), 2))
+        [[0, 1], [2, 3], [4]]
+    """
+    if size < 1:
+        raise ValueError("size must be at least 1")
+    iterator = iter(items)
+    while batch := list(itertools.islice(iterator, size)):
+        yield batch
+
+
+def sliding_window(items: Iterable[E], size: int) -> Iterator[tuple[E, ...]]:
+    """Yield overlapping windows of ``size`` consecutive items.
+
+    Example:
+        >>> list(sliding_window([1, 2, 3, 4], 2))
+        [(1, 2), (2, 3), (3, 4)]
+    """
+    if size < 1:
+        raise ValueError("size must be at least 1")
+    iterator = iter(items)
+    window = tuple(itertools.islice(iterator, size))
+    if len(window) == size:
+        yield window
+    for item in iterator:
+        window = window[1:] + (item,)
+        yield window
+
+
+def take(items: Iterable[E], count: int) -> list[E]:
+    """Return the first ``count`` items of a possibly infinite iterable.
+
+    Example:
+        >>> take(fibonacci(), 6)
+        [0, 1, 1, 2, 3, 5]
+    """
+    if count < 0:
+        raise ValueError("count must be non-negative")
+    return list(itertools.islice(items, count))
+
+
+def fibonacci() -> Iterator[int]:
+    """Yield the Fibonacci sequence indefinitely."""
+    current, following = 0, 1
+    while True:
+        yield current
+        current, following = following, current + following
+
+
+def count_by(items: Iterable[E], key: Callable[[E], Any]) -> dict[Any, int]:
+    """Count items grouped by ``key`` while streaming.
+
+    Example:
+        >>> count_by(["aa", "b", "cc"], len) == {2: 2, 1: 1}
+        True
+    """
+    counts: dict[Any, int] = {}
+    for item in items:
+        bucket = key(item)
+        counts[bucket] = counts.get(bucket, 0) + 1
+    return counts
