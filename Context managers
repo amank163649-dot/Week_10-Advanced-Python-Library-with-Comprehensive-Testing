@@ -1,0 +1,237 @@
+"""Context managers for resources that must always be released.
+
+Included:
+
+* :class:`SafeFileHandler` — atomic writes via a temporary file plus rename.
+* :func:`sqlite_connection` — commit on success, rollback on failure, always close.
+* :func:`temporary_config` — scoped overrides of a mapping.
+* :func:`timed` — measure a block of code.
+
+Example:
+    >>> import tempfile, pathlib
+    >>> target = pathlib.Path(tempfile.mkdtemp()) / "out.txt"
+    >>> with SafeFileHandler(target, "w") as handle:
+    ...     _ = handle.write("hello")
+    >>> target.read_text()
+    'hello'
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sqlite3
+import tempfile
+import time
+from collections.abc import Iterator, Mapping, MutableMapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import TracebackType
+from typing import IO, Any, Literal
+
+from corekit.exceptions import ConfigurationError
+
+__all__ = ["SafeFileHandler", "Timing", "sqlite_connection", "temporary_config", "timed"]
+
+logger = logging.getLogger(__name__)
+
+
+class SafeFileHandler:
+    """Open a file, guaranteeing cleanup and atomic replacement on write.
+
+    In write modes the data goes to a temporary file in the destination
+    directory and is renamed over the target only if the block exits cleanly.
+    A crash mid-write therefore leaves the original file untouched. Read modes
+    behave like :func:`open` with guaranteed closing.
+
+    Args:
+        path: Destination path.
+        mode: Any mode accepted by :func:`open`.
+        encoding: Text encoding; ignored in binary modes.
+
+    Raises:
+        FileNotFoundError: On read modes when the file does not exist.
+
+    Example:
+        >>> import tempfile, pathlib
+        >>> target = pathlib.Path(tempfile.mkdtemp()) / "data.txt"
+        >>> try:
+        ...     with SafeFileHandler(target, "w") as handle:
+        ...         _ = handle.write("partial")
+        ...         raise RuntimeError("boom")
+        ... except RuntimeError:
+        ...     pass
+        >>> target.exists()
+        False
+    """
+
+    def __init__(
+        self, path: str | Path, mode: str = "r", encoding: str | None = "utf-8"
+    ) -> None:
+        self.path = Path(path)
+        self.mode = mode
+        self.encoding = None if "b" in mode else encoding
+        self._handle: IO[Any] | None = None
+        self._temp_path: Path | None = None
+
+    @property
+    def is_write_mode(self) -> bool:
+        """Whether the handler replaces the target file atomically."""
+        return any(flag in self.mode for flag in ("w", "x"))
+
+    def __enter__(self) -> IO[Any]:
+        if not self.is_write_mode and not self.path.exists():
+            raise FileNotFoundError(f"File not found: {self.path}")
+
+        if self.is_write_mode:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temp_name = tempfile.mkstemp(
+                dir=self.path.parent, prefix=f".{self.path.name}.", suffix=".tmp"
+            )
+            os.close(descriptor)
+            self._temp_path = Path(temp_name)
+            self._handle = open(self._temp_path, self.mode, encoding=self.encoding)
+        else:
+            self._handle = open(self.path, self.mode, encoding=self.encoding)
+        logger.debug("Opened %s in mode %s", self.path, self.mode)
+        return self._handle
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
+
+        if self._temp_path is not None:
+            if exc_type is None:
+                os.replace(self._temp_path, self.path)
+                logger.debug("Committed atomic write to %s", self.path)
+            else:
+                self._temp_path.unlink(missing_ok=True)
+                logger.warning("Discarded partial write to %s: %s", self.path, exc)
+            self._temp_path = None
+        return False  # never swallow exceptions
+
+
+@contextmanager
+def sqlite_connection(
+    database: str | Path = ":memory:", *, row_factory: Any = sqlite3.Row
+) -> Iterator[sqlite3.Connection]:
+    """Yield a SQLite connection that commits, rolls back and closes itself.
+
+    Args:
+        database: Database path, or ``":memory:"`` for an ephemeral database.
+        row_factory: Row factory applied to the connection.
+
+    Yields:
+        An open :class:`sqlite3.Connection`.
+
+    Example:
+        >>> with sqlite_connection() as conn:
+        ...     _ = conn.execute("CREATE TABLE t (id INTEGER)")
+        ...     _ = conn.execute("INSERT INTO t VALUES (1)")
+        ...     conn.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+        1
+    """
+    connection = sqlite3.connect(str(database))
+    connection.row_factory = row_factory
+    try:
+        yield connection
+    except Exception:
+        connection.rollback()
+        logger.warning("Rolled back transaction on %s", database)
+        raise
+    else:
+        connection.commit()
+    finally:
+        connection.close()
+        logger.debug("Closed connection to %s", database)
+
+
+@contextmanager
+def temporary_config(
+    config: MutableMapping[str, Any],
+    values: Mapping[str, Any] | None = None,
+    *,
+    strict: bool = False,
+    **kwargs: Any,
+) -> Iterator[MutableMapping[str, Any]]:
+    """Apply configuration overrides for the duration of a block.
+
+    The original values, including absent keys, are restored on exit even if the
+    block raises.
+
+    Args:
+        config: The mapping to modify in place.
+        values: Overrides as a mapping. Use this form when a key would collide
+            with ``strict``, or when keys are not valid identifiers.
+        strict: When true, overriding an unknown key raises.
+        **kwargs: Overrides given as keyword arguments, merged over ``values``.
+
+    Raises:
+        ConfigurationError: In strict mode, for keys absent from ``config``.
+
+    Example:
+        >>> settings = {"debug": False}
+        >>> with temporary_config(settings, debug=True) as scoped:
+        ...     scoped["debug"]
+        True
+        >>> settings
+        {'debug': False}
+    """
+    overrides: dict[str, Any] = {**(values or {}), **kwargs}
+    if strict:
+        unknown = set(overrides) - set(config)
+        if unknown:
+            raise ConfigurationError(
+                f"unknown configuration key(s): {', '.join(sorted(unknown))}"
+            )
+
+    sentinel = object()
+    previous = {key: config.get(key, sentinel) for key in overrides}
+    config.update(overrides)
+    try:
+        yield config
+    finally:
+        for key, value in previous.items():
+            if value is sentinel:
+                config.pop(key, None)
+            else:
+                config[key] = value
+
+
+@dataclass
+class Timing:
+    """Result object produced by :func:`timed`.
+
+    Attributes:
+        label: Name of the measured block.
+        elapsed: Duration in seconds, filled in when the block exits.
+    """
+
+    label: str = "block"
+    elapsed: float = field(default=0.0)
+
+
+@contextmanager
+def timed(label: str = "block", *, level: int = logging.INFO) -> Iterator[Timing]:
+    """Measure the wall-clock duration of a block.
+
+    Example:
+        >>> with timed("demo") as result:
+        ...     total = sum(range(1000))
+        >>> result.elapsed >= 0
+        True
+    """
+    result = Timing(label=label)
+    start = time.perf_counter()
+    try:
+        yield result
+    finally:
+        result.elapsed = time.perf_counter() - start
+        logger.log(level, "%s took %.6fs", label, result.elapsed)
