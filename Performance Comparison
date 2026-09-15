@@ -1,0 +1,131 @@
+"""Compare corekit against the obvious standard-library alternatives.
+
+Measures three things:
+
+1. ``corekit.cache`` versus ``functools.lru_cache`` (TTL costs a little).
+2. Streaming with ``DataPipeline`` versus loading a whole file into a list.
+3. ``corekit.batched`` versus manual slicing of a materialised list.
+
+Run it with::
+
+    python examples/performance_comparison.py
+"""
+
+from __future__ import annotations
+
+import csv
+import functools
+import tempfile
+import time
+import tracemalloc
+from pathlib import Path
+
+from corekit import DataPipeline, batched, cache
+
+ROWS = 100_000
+
+
+def measure(label: str, func, repeat: int = 3) -> float:
+    """Time ``func`` and print the best of ``repeat`` runs."""
+    best = float("inf")
+    for _ in range(repeat):
+        start = time.perf_counter()
+        func()
+        best = min(best, time.perf_counter() - start)
+    print(f"  {label:<38} {best * 1000:9.3f} ms")
+    return best
+
+
+def measure_memory(label: str, func) -> int:
+    """Report the peak memory allocated while ``func`` runs."""
+    tracemalloc.start()
+    func()
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    print(f"  {label:<38} {peak / 1024 / 1024:9.2f} MB")
+    return peak
+
+
+def write_dataset(path: Path) -> None:
+    """Write the CSV fixture used by the file benchmarks."""
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["id", "name", "value"])
+        writer.writerows([index, f"name-{index}", index * 3] for index in range(ROWS))
+
+
+def compare_caches() -> None:
+    """corekit.cache versus functools.lru_cache."""
+    print("\nCaching (repeated calls with the same argument)")
+
+    def expensive(n: int) -> int:
+        return sum(i * i for i in range(n))
+
+    corekit_cached = cache(ttl=None)(expensive)
+    lru_cached = functools.lru_cache(maxsize=128)(expensive)
+    corekit_cached(50_000)
+    lru_cached(50_000)
+
+    cold = measure("no cache", lambda: expensive(50_000))
+    kit = measure("corekit.cache (TTL aware)", lambda: corekit_cached(50_000))
+    lru = measure("functools.lru_cache", lambda: lru_cached(50_000))
+
+    print(f"  -> corekit.cache is {cold / kit:,.0f}x faster than recomputing")
+    print(f"  -> TTL bookkeeping costs about {(kit - lru) * 1e6:.1f} us per hit")
+
+
+def compare_file_processing(path: Path) -> None:
+    """Streaming versus loading the entire file."""
+    print(f"\nProcessing a {ROWS:,}-row CSV: time")
+
+    def eager() -> int:
+        with path.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        return sum(int(row["value"]) for row in rows)
+
+    def streaming() -> int:
+        return sum(
+            int(row["value"]) for row in DataPipeline().process_large_file(path)
+        )
+
+    measure("read into a list, then sum", eager, repeat=2)
+    measure("DataPipeline streaming", streaming, repeat=2)
+
+    print(f"\nProcessing a {ROWS:,}-row CSV: peak memory")
+    eager_peak = measure_memory("read into a list, then sum", eager)
+    lazy_peak = measure_memory("DataPipeline streaming", streaming)
+    print(f"  -> streaming uses {eager_peak / lazy_peak:,.0f}x less memory")
+
+
+def compare_batching() -> None:
+    """Lazy batching versus slicing a materialised list."""
+    print("\nBatching one million integers")
+
+    def manual() -> int:
+        items = list(range(1_000_000))
+        return sum(len(items[i : i + 1000]) for i in range(0, len(items), 1000))
+
+    def lazy() -> int:
+        return sum(len(batch) for batch in batched(range(1_000_000), 1000))
+
+    measure("slice a materialised list", manual, repeat=2)
+    measure("corekit.batched (lazy)", lazy, repeat=2)
+    manual_peak = measure_memory("slice a materialised list", manual)
+    lazy_peak = measure_memory("corekit.batched (lazy)", lazy)
+    print(f"  -> lazy batching uses {manual_peak / lazy_peak:,.0f}x less memory")
+
+
+def main() -> None:
+    """Run every comparison."""
+    print("corekit — performance comparison")
+    with tempfile.TemporaryDirectory() as name:
+        dataset = Path(name) / "dataset.csv"
+        write_dataset(dataset)
+        compare_caches()
+        compare_file_processing(dataset)
+        compare_batching()
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
