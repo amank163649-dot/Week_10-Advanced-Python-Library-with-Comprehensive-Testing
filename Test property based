@@ -1,0 +1,133 @@
+"""Property-based tests using Hypothesis.
+
+These assert invariants that must hold for *every* input, which catches edge
+cases hand-written examples tend to miss (empty inputs, unicode, huge integers).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from hypothesis import given, settings
+from hypothesis import strategies as st
+
+from corekit.core.decorators import Cache, cache
+from corekit.core.generators import batched, count_by, fibonacci, sliding_window, take
+from corekit.utils.serializers import dumps, loads, to_builtin
+from corekit.utils.validators import check_type
+
+json_values = st.recursive(
+    st.none() | st.booleans() | st.integers() | st.text(),
+    lambda children: st.lists(children) | st.dictionaries(st.text(), children),
+    max_leaves=20,
+)
+
+
+class TestGeneratorProperties:
+    @given(items=st.lists(st.integers()), size=st.integers(min_value=1, max_value=50))
+    def test_batching_preserves_every_item_in_order(
+        self, items: list[int], size: int
+    ) -> None:
+        batches = list(batched(items, size))
+        assert [item for batch in batches for item in batch] == items
+
+    @given(items=st.lists(st.integers()), size=st.integers(min_value=1, max_value=50))
+    def test_only_the_final_batch_may_be_short(
+        self, items: list[int], size: int
+    ) -> None:
+        batches = list(batched(items, size))
+        assert all(len(batch) == size for batch in batches[:-1])
+        assert all(batch for batch in batches)
+
+    @given(
+        items=st.lists(st.integers(), min_size=1),
+        size=st.integers(min_value=1, max_value=10),
+    )
+    def test_sliding_window_count_is_predictable(
+        self, items: list[int], size: int
+    ) -> None:
+        windows = list(sliding_window(items, size))
+        assert len(windows) == max(0, len(items) - size + 1)
+        assert all(len(window) == size for window in windows)
+
+    @given(count=st.integers(min_value=0, max_value=100))
+    def test_take_returns_exactly_the_requested_count(self, count: int) -> None:
+        assert len(take(fibonacci(), count)) == count
+
+    @given(count=st.integers(min_value=3, max_value=60))
+    def test_fibonacci_satisfies_its_recurrence(self, count: int) -> None:
+        values = take(fibonacci(), count)
+        assert all(
+            values[i] == values[i - 1] + values[i - 2] for i in range(2, len(values))
+        )
+
+    @given(items=st.lists(st.text()))
+    def test_counts_sum_to_the_input_length(self, items: list[str]) -> None:
+        assert sum(count_by(items, key=len).values()) == len(items)
+
+
+class TestSerializerProperties:
+    @given(value=json_values)
+    def test_json_round_trip_is_lossless(self, value: Any) -> None:
+        assert loads(dumps(value)) == to_builtin(value)
+
+    @given(value=json_values)
+    def test_output_contains_only_builtin_types(self, value: Any) -> None:
+        def assert_builtin(node: Any) -> None:
+            assert node is None or isinstance(node, (str, int, float, bool, list, dict))
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    assert isinstance(key, str)
+                    assert_builtin(child)
+            elif isinstance(node, list):
+                for child in node:
+                    assert_builtin(child)
+
+        assert_builtin(to_builtin(value))
+
+
+class TestCacheProperties:
+    @given(
+        calls=st.lists(st.integers(min_value=0, max_value=5), min_size=1, max_size=40)
+    )
+    @settings(max_examples=50)
+    def test_the_function_runs_once_per_distinct_argument(
+        self, calls: list[int]
+    ) -> None:
+        executed: list[int] = []
+
+        @cache(ttl=None, maxsize=256)
+        def identity(value: int) -> int:
+            executed.append(value)
+            return value
+
+        results = [identity(value) for value in calls]
+        assert results == calls
+        assert sorted(executed) == sorted(set(calls))
+
+    @given(
+        args=st.tuples(st.integers(), st.text()),
+        kwargs=st.dictionaries(st.text(min_size=1), st.integers(), max_size=4),
+    )
+    def test_key_generation_is_stable_and_hashable(
+        self, args: tuple[Any, ...], kwargs: dict[str, int]
+    ) -> None:
+        first = Cache.make_key("f", args, kwargs)
+        second = Cache.make_key("f", args, dict(reversed(list(kwargs.items()))))
+        assert first == second
+        assert hash(first) == hash(second)
+
+
+class TestValidationProperties:
+    @given(value=st.integers())
+    def test_integers_are_never_confused_with_strings(self, value: int) -> None:
+        assert check_type(value, int)
+        assert not check_type(value, str)
+
+    @given(items=st.lists(st.integers()))
+    def test_homogeneous_lists_always_validate(self, items: list[int]) -> None:
+        assert check_type(items, list[int])
+
+    @given(value=st.one_of(st.integers(), st.none()))
+    def test_optional_annotations_accept_none(self, value: int | None) -> None:
+        assert check_type(value, int | None)
