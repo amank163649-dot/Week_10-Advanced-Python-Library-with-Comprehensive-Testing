@@ -1,0 +1,208 @@
+"""Metaclasses that customise class creation.
+
+Two metaclasses live here:
+
+* :class:`PluginMeta` — auto-registers concrete subclasses in a global registry,
+  which removes the need for manual ``register()`` calls.
+* :class:`ModelMeta` — collects annotated attributes into ``__fields__`` so
+  :class:`corekit.utils.validators.ValidatedModel` can validate them at runtime.
+
+Example:
+    >>> from corekit.core.metaclasses import Plugin, get_plugin
+    >>> class Shout(Plugin):
+    ...     name = "shout"
+    ...     def run(self, record):
+    ...         return {k: str(v).upper() for k, v in record.items()}
+    >>> get_plugin("shout")().run({"a": "hi"})
+    {'a': 'HI'}
+"""
+
+from __future__ import annotations
+
+from abc import ABC, ABCMeta, abstractmethod
+from typing import Any, ClassVar, get_type_hints
+
+from corekit.exceptions import PluginError
+from corekit.types import Record
+
+__all__ = [
+    "PluginMeta",
+    "Plugin",
+    "ModelMeta",
+    "SingletonMeta",
+    "available_plugins",
+    "get_plugin",
+    "registry",
+    "unregister_plugin",
+]
+
+_REGISTRY: dict[str, type["Plugin"]] = {}
+
+
+def _is_classvar(annotation: Any) -> bool:
+    """Return whether an annotation is a ``ClassVar``, string form included."""
+    if isinstance(annotation, str):
+        return annotation.startswith(("ClassVar", "typing.ClassVar"))
+    return getattr(annotation, "__origin__", None) is ClassVar or annotation is ClassVar
+
+
+class PluginMeta(ABCMeta):
+    """Metaclass that registers every concrete :class:`Plugin` subclass.
+
+    A subclass is considered concrete when it declares a non-empty ``name`` and
+    has no remaining abstract methods.
+
+    Raises:
+        PluginError: If two plugins claim the same ``name``.
+    """
+
+    def __new__(
+        mcls,
+        cls_name: str,
+        bases: tuple[type, ...],
+        namespace: dict[str, Any],
+        **kwargs: Any,
+    ) -> "PluginMeta":
+        cls = super().__new__(mcls, cls_name, bases, namespace, **kwargs)
+        name = namespace.get("name", "")
+        if not name or getattr(cls, "__abstractmethods__", None):
+            return cls
+        if name in _REGISTRY and _REGISTRY[name] is not cls:
+            raise PluginError(
+                f"Plugin name {name!r} is already registered by "
+                f"{_REGISTRY[name].__qualname__}"
+            )
+        _REGISTRY[name] = cls  # type: ignore[assignment]
+        return cls
+
+
+class Plugin(ABC, metaclass=PluginMeta):
+    """Base class for record transformers discovered through the registry.
+
+    Subclasses set a unique ``name`` and implement :meth:`run`.
+    """
+
+    #: Unique registry key. Empty on abstract intermediate classes.
+    name: ClassVar[str] = ""
+    #: Human readable summary shown by the CLI.
+    description: ClassVar[str] = ""
+
+    @abstractmethod
+    def run(self, record: Record) -> Record | None:
+        """Transform a single record, or return ``None`` to drop it."""
+
+    def __call__(self, record: Record) -> Record | None:
+        """Allow plugins to be used directly as pipeline processors."""
+        return self.run(record)
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return f"<{type(self).__name__} name={self.name!r}>"
+
+
+def registry() -> dict[str, type[Plugin]]:
+    """Return a copy of the plugin registry keyed by plugin name."""
+    return dict(_REGISTRY)
+
+
+def available_plugins() -> list[str]:
+    """Return the sorted names of all registered plugins."""
+    return sorted(_REGISTRY)
+
+
+def get_plugin(name: str) -> type[Plugin]:
+    """Look up a plugin class by name.
+
+    Args:
+        name: Registry key of the plugin.
+
+    Returns:
+        The plugin class.
+
+    Raises:
+        PluginError: If no plugin is registered under ``name``.
+    """
+    try:
+        return _REGISTRY[name]
+    except KeyError:
+        known = ", ".join(available_plugins()) or "none"
+        raise PluginError(f"Unknown plugin {name!r}. Available: {known}") from None
+
+
+def unregister_plugin(name: str) -> None:
+    """Remove a plugin from the registry; primarily useful in tests."""
+    _REGISTRY.pop(name, None)
+
+
+class ModelMeta(type):
+    """Metaclass that gathers annotated class attributes into ``__fields__``.
+
+    Fields are collected from base classes first, so subclasses inherit and can
+    override the fields of their parents.
+    """
+
+    def __new__(
+        mcls,
+        cls_name: str,
+        bases: tuple[type, ...],
+        namespace: dict[str, Any],
+        **kwargs: Any,
+    ) -> "ModelMeta":
+        annotations = {
+            name: annotation
+            for name, annotation in namespace.get("__annotations__", {}).items()
+            if not name.startswith("_") and not _is_classvar(annotation)
+        }
+
+        fields: dict[str, Any] = {}
+        for base in bases:
+            fields.update(getattr(base, "__fields__", {}))
+        fields.update(annotations)
+
+        defaults: dict[str, Any] = {}
+        for base in bases:
+            defaults.update(getattr(base, "__field_defaults__", {}))
+        for field_name in annotations:
+            if field_name in namespace:
+                defaults[field_name] = namespace[field_name]
+
+        namespace["__fields__"] = fields
+        namespace["__field_defaults__"] = defaults
+        # Class-level defaults are stored on ``__field_defaults__`` instead, so
+        # that a missing attribute cannot silently shadow an unset instance value.
+        for field_name in defaults:
+            namespace.pop(field_name, None)
+
+        cls = super().__new__(mcls, cls_name, bases, namespace, **kwargs)
+
+        # ``from __future__ import annotations`` turns annotations into strings.
+        # Resolve them once, here, so validation sees real type objects.
+        try:
+            hints = get_type_hints(cls)
+        except Exception:  # pragma: no cover - unresolvable forward references
+            hints = {}
+        for field_name in fields:
+            if field_name in hints:
+                fields[field_name] = hints[field_name]
+        return cls
+
+
+class SingletonMeta(type):
+    """Metaclass producing one shared instance per class.
+
+    Example:
+        >>> class Settings(metaclass=SingletonMeta):
+        ...     pass
+        >>> Settings() is Settings()
+        True
+    """
+
+    _instances: ClassVar[dict[type, Any]] = {}
+
+    def __call__(cls, *args: Any, **kwargs: Any) -> Any:
+        if cls not in SingletonMeta._instances:
+            SingletonMeta._instances[cls] = super().__call__(*args, **kwargs)
+        return SingletonMeta._instances[cls]
+
+    def reset(cls) -> None:
+        """Forget the cached instance for this class."""
+        SingletonMeta._instances.pop(cls, None)
