@@ -1,0 +1,362 @@
+"""Reusable function decorators.
+
+The decorators here cover three recurring needs: surviving flaky calls
+(:func:`retry`), avoiding repeated work (:class:`Cache` / :func:`cache`) and
+observing behaviour (:func:`timer`). :func:`validate_call` enforces the type
+hints you already wrote at runtime.
+
+All wrappers use :func:`functools.wraps`, so names, docstrings, annotations and
+``__wrapped__`` survive decoration and remain visible to ``help()``, Sphinx and
+``inspect.signature``.
+
+Example:
+    >>> calls = []
+    >>> @cache(ttl=60)
+    ... def square(n: int) -> int:
+    ...     calls.append(n)
+    ...     return n * n
+    >>> square(4), square(4), calls
+    (16, 16, [4])
+"""
+
+from __future__ import annotations
+
+import functools
+import inspect
+import logging
+import threading
+import time
+import warnings
+from collections.abc import Callable, Hashable
+
+from typing import Any, cast, get_type_hints
+
+from corekit.exceptions import RetryError, ValidationError
+from corekit.types import CacheKey, P, T
+
+__all__ = ["Cache", "cache", "deprecated", "retry", "timer", "validate_call"]
+
+logger = logging.getLogger(__name__)
+
+
+def retry(
+    max_attempts: int = 3,
+    delay: float = 1.0,
+    backoff: float = 2.0,
+    exceptions: type[BaseException] | tuple[type[BaseException], ...] = Exception,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Callable[[Callable[P, T]], Callable[P, T]]:
+    """Retry a callable with exponential backoff.
+
+    Args:
+        max_attempts: Total number of attempts, including the first one.
+        delay: Seconds to wait before the second attempt.
+        backoff: Multiplier applied to the delay after each failure.
+        exceptions: Exception type(s) that trigger a retry. Anything else
+            propagates immediately.
+        sleep: Injected sleep function; override it in tests to avoid real waits.
+
+    Returns:
+        A decorator wrapping the target callable.
+
+    Raises:
+        ValueError: If ``max_attempts`` is below 1 or ``delay``/``backoff`` are
+            negative.
+        RetryError: From the wrapper, when every attempt fails. The last
+            exception is attached as ``__cause__``.
+
+    Example:
+        >>> state = {"n": 0}
+        >>> @retry(max_attempts=3, delay=0, exceptions=ValueError)
+        ... def flaky() -> str:
+        ...     state["n"] += 1
+        ...     if state["n"] < 3:
+        ...         raise ValueError("not yet")
+        ...     return "ok"
+        >>> flaky()
+        'ok'
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    if delay < 0 or backoff < 0:
+        raise ValueError("delay and backoff must be non-negative")
+
+    def decorator(func: Callable[P, T]) -> Callable[P, T]:
+        @functools.wraps(func)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+            current_delay = delay
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as exc:
+                    logger.warning(
+                        "Attempt %d/%d failed for %s: %s",
+                        attempt,
+                        max_attempts,
+                        func.__name__,
+                        exc,
+                    )
+                    if attempt == max_attempts:
+                        raise RetryError(
+                            f"{func.__name__} failed after {max_attempts} attempt(s)",
+                            attempts=attempt,
+                        ) from exc
+                    sleep(current_delay)
+                    current_delay *= backoff
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        return wrapper
+
+    return decorator
+
+
+class Cache:
+    """Memoizing decorator with time-to-live expiry and hit/miss statistics.
+
+    The cache is thread safe and bounded: when ``maxsize`` is reached the
+    oldest entry is evicted.
+
+    Args:
+        ttl: Lifetime of an entry in seconds. ``None`` means "never expire".
+        maxsize: Maximum number of entries to keep.
+        clock: Injected monotonic clock; override it in tests.
+
+    Example:
+        >>> c = Cache(ttl=None)
+        >>> @c
+        ... def slow(n: int) -> int:
+        ...     return n * 2
+        >>> slow(2), slow(2), c.stats
+        (4, 4, {'hits': 1, 'misses': 1, 'evictions': 0})
+    """
+
+    def __init__(
+        self,
+        ttl: float | None = 3600,
+        maxsize: int = 128,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if maxsize < 1:
+            raise ValueError("maxsize must be at least 1")
+        self.ttl = ttl
+        self.maxsize = maxsize
+        self._clock = clock
+        self._entries: dict[CacheKey, tuple[Any, float]] = {}
+        self._lock = threading.RLock()
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+
+    def __call__(self, func: Callable[P, T]) -> Callable[P, T]:
+        """Decorate ``func`` so its results are memoized."""
+
+        @functools.wraps(func)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+            key = self.make_key(func.__qualname__, args, kwargs)
+            with self._lock:
+                entry = self._entries.get(key)
+                if entry is not None:
+                    value, stored_at = entry
+                    if self.ttl is None or self._clock() - stored_at < self.ttl:
+                        self._hits += 1
+                        logger.debug("Cache hit for %s", func.__name__)
+                        return cast(T, value)
+                    del self._entries[key]
+                self._misses += 1
+
+            logger.debug("Cache miss for %s", func.__name__)
+            result = func(*args, **kwargs)
+
+            with self._lock:
+                if len(self._entries) >= self.maxsize and key not in self._entries:
+                    self._entries.pop(next(iter(self._entries)))
+                    self._evictions += 1
+                self._entries[key] = (result, self._clock())
+            return result
+
+        wrapper.cache = self  # type: ignore[attr-defined]
+        wrapper.clear_cache = self.clear  # type: ignore[attr-defined]
+        return wrapper
+
+    @staticmethod
+    def make_key(
+        func_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> CacheKey:
+        """Build a hashable key from a call signature.
+
+        Unhashable arguments fall back to their ``repr``, so the decorator never
+        raises on dictionaries or lists.
+        """
+
+        def normalise(value: Any) -> Hashable:
+            if isinstance(value, Hashable):
+                try:
+                    hash(value)
+                except TypeError:  # pragma: no cover - tuple of lists
+                    return repr(value)
+                return value
+            return repr(value)
+
+        parts: list[Hashable] = [func_name]
+        parts.extend(normalise(arg) for arg in args)
+        for name in sorted(kwargs):
+            parts.append(name)
+            parts.append(normalise(kwargs[name]))
+        return tuple(parts)
+
+    @property
+    def stats(self) -> dict[str, int]:
+        """Return hit, miss and eviction counters."""
+        with self._lock:
+            return {
+                "hits": self._hits,
+                "misses": self._misses,
+                "evictions": self._evictions,
+            }
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def clear(self) -> None:
+        """Drop every entry and reset the statistics."""
+        with self._lock:
+            self._entries.clear()
+            self._hits = self._misses = self._evictions = 0
+        logger.info("Cache cleared")
+
+
+def cache(
+    ttl: float | None = 3600,
+    maxsize: int = 128,
+    clock: Callable[[], float] = time.monotonic,
+) -> Cache:
+    """Return a configured :class:`Cache` usable as a decorator.
+
+    Example:
+        >>> @cache(ttl=1)
+        ... def add(a: int, b: int) -> int:
+        ...     return a + b
+        >>> add(1, 2)
+        3
+    """
+    return Cache(ttl=ttl, maxsize=maxsize, clock=clock)
+
+
+def timer(
+    func: Callable[P, T] | None = None,
+    *,
+    level: int = logging.INFO,
+    on_result: Callable[[str, float], None] | None = None,
+) -> Callable[P, T] | Callable[[Callable[P, T]], Callable[P, T]]:
+    """Log how long a call took. Usable bare or with arguments.
+
+    Args:
+        func: The function, when used as a bare ``@timer``.
+        level: Logging level for the emitted message.
+        on_result: Optional callback receiving ``(function_name, seconds)``.
+
+    Example:
+        >>> seen = []
+        >>> @timer(on_result=lambda name, secs: seen.append(name))
+        ... def work() -> int:
+        ...     return 42
+        >>> work(), seen
+        (42, ['work'])
+    """
+
+    def decorator(target: Callable[P, T]) -> Callable[P, T]:
+        @functools.wraps(target)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+            start = time.perf_counter()
+            try:
+                return target(*args, **kwargs)
+            finally:
+                elapsed = time.perf_counter() - start
+                logger.log(level, "%s executed in %.6fs", target.__name__, elapsed)
+                if on_result is not None:
+                    on_result(target.__name__, elapsed)
+
+        return wrapper
+
+    if func is not None:
+        return decorator(func)
+    return decorator
+
+
+def validate_call(func: Callable[P, T]) -> Callable[P, T]:
+    """Enforce a function's own type hints at call time.
+
+    Both arguments and the return value are checked against the annotations.
+    Unannotated parameters are skipped.
+
+    Raises:
+        ValidationError: From the wrapper, when an argument or the return value
+            does not match its annotation.
+
+    Example:
+        >>> @validate_call
+        ... def greet(name: str, times: int = 1) -> str:
+        ...     return f"hi {name} " * times
+        >>> greet("ada", times="two")
+        Traceback (most recent call last):
+            ...
+        corekit.exceptions.ValidationError: argument 'times' expected int, got str
+    """
+    from corekit.utils.validators import check_type, type_name
+
+    signature = inspect.signature(func)
+    try:
+        hints = get_type_hints(func)
+    except Exception:  # pragma: no cover - unresolvable forward references
+        hints = dict(getattr(func, "__annotations__", {}))
+
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        for name, value in bound.arguments.items():
+            annotation = hints.get(name, Any)
+            parameter = signature.parameters[name]
+            if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                values: tuple[Any, ...] = value
+            elif parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                values = tuple(value.values())
+            else:
+                values = (value,)
+            for item in values:
+                if not check_type(item, annotation):
+                    raise ValidationError(
+                        f"argument {name!r} expected {type_name(annotation)}, "
+                        f"got {type(item).__name__}",
+                        field=name,
+                    )
+
+        result = func(*args, **kwargs)
+        return_annotation = hints.get("return", Any)
+        if not check_type(result, return_annotation):
+            raise ValidationError(
+                f"{func.__name__} returned {type(result).__name__}, "
+                f"expected {type_name(return_annotation)}"
+            )
+        return result
+
+    return wrapper
+
+
+def deprecated(reason: str) -> Callable[[Callable[P, T]], Callable[P, T]]:
+    """Emit a :class:`DeprecationWarning` whenever the callable is used."""
+
+    def decorator(func: Callable[P, T]) -> Callable[P, T]:
+        @functools.wraps(func)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+            warnings.warn(
+                f"{func.__name__} is deprecated: {reason}",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
