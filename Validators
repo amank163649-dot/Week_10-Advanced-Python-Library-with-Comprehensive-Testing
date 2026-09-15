@@ -1,0 +1,357 @@
+"""Runtime validation built on top of standard type annotations.
+
+The module offers three layers:
+
+1. :func:`check_type` — structural checking of a value against an annotation
+   (``int``, ``str | None``, ``list[int]``, ``dict[str, int]``, ...).
+2. Constraint factories such as :func:`positive` and :func:`min_length`.
+3. :class:`ValidatedModel` — a declarative base class that validates its fields
+   on construction using :class:`corekit.core.metaclasses.ModelMeta`.
+
+Example:
+    >>> class User(ValidatedModel):
+    ...     name: str
+    ...     age: int = Field(default=0, validator=positive())
+    >>> User(name="Ada", age=36).to_dict()
+    {'name': 'Ada', 'age': 36}
+"""
+
+from __future__ import annotations
+
+import re
+import types as _types
+from collections.abc import Callable, Mapping
+from typing import Any, ClassVar, Union, get_args, get_origin
+
+from corekit.core.metaclasses import ModelMeta
+from corekit.exceptions import ValidationError
+from corekit.types import Record
+
+__all__ = [
+    "MISSING",
+    "Field",
+    "ValidatedModel",
+    "check_type",
+    "is_instance_of",
+    "matches",
+    "max_length",
+    "min_length",
+    "one_of",
+    "positive",
+    "type_name",
+]
+
+
+class _Missing:
+    """Sentinel type for "no default supplied"."""
+
+    _instance: "_Missing | None" = None
+
+    def __new__(cls) -> "_Missing":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return "MISSING"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+#: Sentinel meaning "this field has no default and must be supplied".
+MISSING = _Missing()
+
+
+def type_name(annotation: Any) -> str:
+    """Return a readable name for an annotation object."""
+    return getattr(annotation, "__name__", None) or str(annotation)
+
+
+def check_type(value: Any, annotation: Any) -> bool:
+    """Check ``value`` against ``annotation`` structurally.
+
+    Supports ``Any``, plain classes, unions (including ``X | None``), and the
+    generic containers ``list``, ``set``, ``frozenset``, ``tuple`` and ``dict``.
+    Container contents are checked element by element.
+
+    Args:
+        value: The value to test.
+        annotation: A type annotation object.
+
+    Returns:
+        ``True`` when the value conforms to the annotation.
+
+    Example:
+        >>> check_type([1, 2], list[int])
+        True
+        >>> check_type([1, "x"], list[int])
+        False
+    """
+    if annotation is Any or annotation is None and value is None:
+        return True
+    if annotation is None or annotation is type(None):
+        return value is None
+
+    origin = get_origin(annotation)
+    if origin is None:
+        if isinstance(annotation, str):
+            # Unresolvable forward reference: accept rather than guess.
+            return True
+        if annotation is float:
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if annotation is int:
+            return isinstance(value, int) and not isinstance(value, bool)
+        try:
+            return isinstance(value, annotation)
+        except TypeError:  # pragma: no cover - exotic annotations
+            return True
+
+    args = get_args(annotation)
+    if origin is Union or origin is _types.UnionType:
+        return any(check_type(value, arg) for arg in args)
+    if origin in (list, set, frozenset):
+        if not isinstance(value, origin):
+            return False
+        return not args or all(check_type(item, args[0]) for item in value)
+    if origin is tuple:
+        if not isinstance(value, tuple):
+            return False
+        if not args:
+            return True
+        if len(args) == 2 and args[1] is Ellipsis:
+            return all(check_type(item, args[0]) for item in value)
+        return len(value) == len(args) and all(
+            check_type(item, arg) for item, arg in zip(value, args)
+        )
+    if origin is dict:
+        if not isinstance(value, dict):
+            return False
+        if not args:
+            return True
+        key_t, val_t = args
+        return all(
+            check_type(k, key_t) and check_type(v, val_t) for k, v in value.items()
+        )
+    try:
+        return isinstance(value, origin)
+    except TypeError:  # pragma: no cover - exotic annotations
+        return True
+
+
+# --------------------------------------------------------------------------- #
+# Constraint factories
+# --------------------------------------------------------------------------- #
+Constraint = Callable[[Any], None]
+
+
+def positive() -> Constraint:
+    """Return a constraint requiring a number greater than zero."""
+
+    def _check(value: Any) -> None:
+        if value <= 0:
+            raise ValidationError(f"expected a positive number, got {value!r}")
+
+    return _check
+
+
+def min_length(length: int) -> Constraint:
+    """Return a constraint requiring ``len(value) >= length``."""
+
+    def _check(value: Any) -> None:
+        if len(value) < length:
+            raise ValidationError(f"expected at least {length} items, got {len(value)}")
+
+    return _check
+
+
+def max_length(length: int) -> Constraint:
+    """Return a constraint requiring ``len(value) <= length``."""
+
+    def _check(value: Any) -> None:
+        if len(value) > length:
+            raise ValidationError(f"expected at most {length} items, got {len(value)}")
+
+    return _check
+
+
+def matches(pattern: str) -> Constraint:
+    """Return a constraint requiring a full regular expression match."""
+    compiled = re.compile(pattern)
+
+    def _check(value: Any) -> None:
+        if not compiled.fullmatch(str(value)):
+            raise ValidationError(f"{value!r} does not match {pattern!r}")
+
+    return _check
+
+
+def one_of(*allowed: Any) -> Constraint:
+    """Return a constraint requiring membership of ``allowed``."""
+
+    def _check(value: Any) -> None:
+        if value not in allowed:
+            raise ValidationError(f"{value!r} is not one of {allowed!r}")
+
+    return _check
+
+
+def is_instance_of(annotation: Any) -> Constraint:
+    """Return a constraint delegating to :func:`check_type`."""
+
+    def _check(value: Any) -> None:
+        if not check_type(value, annotation):
+            raise ValidationError(f"expected {type_name(annotation)}, got {value!r}")
+
+    return _check
+
+
+class Field:
+    """Declarative description of a model field.
+
+    Args:
+        default: Value used when the field is omitted. Omit for a required field.
+        default_factory: Zero-argument callable producing a fresh default; use
+            this for mutable defaults such as lists.
+        validator: Optional constraint applied after the type check.
+        description: Human readable documentation for the field.
+    """
+
+    __slots__ = ("default", "default_factory", "validator", "description")
+
+    def __init__(
+        self,
+        default: Any = MISSING,
+        *,
+        default_factory: Callable[[], Any] | None = None,
+        validator: Constraint | None = None,
+        description: str = "",
+    ) -> None:
+        if default is not MISSING and default_factory is not None:
+            raise ValidationError("provide either default or default_factory, not both")
+        self.default = default
+        self.default_factory = default_factory
+        self.validator = validator
+        self.description = description
+
+    def get_default(self) -> Any:
+        """Return this field's default value, or :data:`MISSING`."""
+        if self.default_factory is not None:
+            return self.default_factory()
+        return self.default
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return f"Field(default={self.default!r})"
+
+
+class ValidatedModel(metaclass=ModelMeta):
+    """Base class for small, self-validating data objects.
+
+    Fields are declared with ordinary annotations. Values are type-checked on
+    construction and, when the class is not frozen, on every attribute
+    assignment.
+
+    Raises:
+        ValidationError: On unknown, missing or ill-typed fields.
+
+    Example:
+        >>> class Point(ValidatedModel):
+        ...     x: int
+        ...     y: int = 0
+        >>> Point(x=1)
+        Point(x=1, y=0)
+    """
+
+    #: When true, instances reject attribute assignment after construction.
+    __frozen__: bool = False
+    #: Field name to resolved annotation, populated by :class:`ModelMeta`.
+    __fields__: ClassVar[dict[str, Any]] = {}
+    #: Field name to default value or :class:`Field`, populated by the metaclass.
+    __field_defaults__: ClassVar[dict[str, Any]] = {}
+
+    def __init__(self, **kwargs: Any) -> None:
+        fields: dict[str, Any] = type(self).__fields__
+        defaults: dict[str, Any] = type(self).__field_defaults__
+
+        unknown = set(kwargs) - set(fields)
+        if unknown:
+            raise ValidationError(
+                f"unknown field(s) for {type(self).__name__}: "
+                f"{', '.join(sorted(unknown))}",
+                field=sorted(unknown)[0],
+            )
+
+        for name, annotation in fields.items():
+            spec = defaults.get(name, MISSING)
+            field = spec if isinstance(spec, Field) else Field(default=spec)
+            if name in kwargs:
+                value = kwargs[name]
+            else:
+                value = field.get_default()
+                if value is MISSING:
+                    raise ValidationError(
+                        f"missing required field {name!r}", field=name
+                    )
+            self._validate(name, value, annotation, field)
+            object.__setattr__(self, name, value)
+
+    @classmethod
+    def _field_spec(cls, name: str) -> Field:
+        spec = cls.__field_defaults__.get(name, MISSING)
+        if isinstance(spec, Field):
+            return spec
+        return Field(default=spec)
+
+    def _validate(self, name: str, value: Any, annotation: Any, field: Field) -> None:
+        if not check_type(value, annotation):
+            raise ValidationError(
+                f"field {name!r} expected {type_name(annotation)}, "
+                f"got {type(value).__name__}",
+                field=name,
+            )
+        if field.validator is not None:
+            try:
+                field.validator(value)
+            except ValidationError as exc:
+                raise ValidationError(f"field {name!r}: {exc}", field=name) from None
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        fields = type(self).__fields__
+        if name in fields:
+            if self.__frozen__:
+                raise ValidationError(
+                    f"{type(self).__name__} is immutable", field=name
+                )
+            self._validate(name, value, fields[name], type(self)._field_spec(name))
+        object.__setattr__(self, name, value)
+
+    def to_dict(self) -> Record:
+        """Return the model as a plain dictionary in declaration order."""
+        return {name: getattr(self, name) for name in type(self).__fields__}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ValidatedModel":
+        """Build an instance from a mapping.
+
+        Raises:
+            ValidationError: If the mapping does not satisfy the model.
+        """
+        return cls(**dict(data))
+
+    def replace(self, **changes: Any) -> "ValidatedModel":
+        """Return a new instance with ``changes`` applied."""
+        return type(self)(**{**self.to_dict(), **changes})
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, type(self)):
+            return NotImplemented
+        return self.to_dict() == other.to_dict()
+
+    def __hash__(self) -> int:
+        # Fields may hold unhashable values (lists, dicts), so hash a stable
+        # textual form rather than the values themselves.
+        return hash((type(self).__name__, repr(self.to_dict())))
+
+    def __repr__(self) -> str:
+        body = ", ".join(f"{k}={v!r}" for k, v in self.to_dict().items())
+        return f"{type(self).__name__}({body})"
